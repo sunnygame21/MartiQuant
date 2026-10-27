@@ -11,7 +11,7 @@
 #   stop <tag>                     SIGTERM → wait 10s → SIGKILL
 #   status [tag]                   list running instances (or just one)
 #   restart <tag> [extra args ...] stop then start (needs full args again)
-#   watch                          relaunch any dead instance (for cron)
+#   watch                          relaunch any dead instance from its latest state.json (cron)
 #   list                           show all remembered launch commands
 #
 # Usage examples:
@@ -21,12 +21,14 @@
 #   bash martiquant/live/run.sh stop paper-cb-100k
 #
 # Cron entry for auto-restart (every minute, silent if alive):
-#   * * * * * cd /Users/zhangjiawei/repos/MartiQuant && bash martiquant/live/run.sh watch
+#   * * * * * cd /home/ubuntu/MartiQuant && bash martiquant/live/run.sh watch
 #
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 RUNS_DIR="runs/_live_logs"
+# cron's PATH only has the system python3, which lacks the deps — prefer the repo venv
+PY=".venv/bin/python"; [ -x "$PY" ] || PY="python3"
 mkdir -p "$RUNS_DIR"
 
 pidfile() { echo "$RUNS_DIR/$1.pid"; }
@@ -50,7 +52,7 @@ start() {
         return 1
     fi
 
-    local cmd="python3 -m martiquant.live --tag $tag $*"
+    local cmd="$PY -m martiquant.live --tag $tag $*"
     echo "$cmd" > "$cf"
     echo "Starting [$tag]: $cmd"
     nohup $cmd >> "$lf" 2>&1 &
@@ -121,11 +123,17 @@ status_all() {
 watch() {
     shopt -s nullglob
     for cf in "$RUNS_DIR"/*.cmd; do
-        local tag pf lf cmd
+        local tag pf lf cmd states
         tag=$(basename "$cf" .cmd)
         pf=$(pidfile "$tag"); lf=$(logfile "$tag")
         if alive "$pf"; then continue; fi
-        cmd=$(cat "$cf")
+        # Resume from this tag's newest state.json (glob sorts by run timestamp); a plain
+        # relaunch would cold-start and drop open ladders. state.load still refuses >1h old.
+        cmd=$(sed -E 's/ --resume-from [^ ]+//' "$cf")
+        states=(runs/live_????????T??????Z_"$tag"/state.json)
+        if [ ${#states[@]} -gt 0 ]; then
+            cmd="$cmd --resume-from $(dirname "${states[${#states[@]}-1]}")"
+        fi
         echo "[watch $(date -u +%FT%TZ)] [$tag] dead, restarting: $cmd" >> "$lf"
         rm -f "$pf"
         nohup $cmd >> "$lf" 2>&1 &
