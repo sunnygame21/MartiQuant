@@ -3,6 +3,12 @@
 Reads 1m closed bars from WSFeed, drives PaperBroker.match_bar + LadderStrategy
 exactly like paper_backtest.py — just streaming instead of looping.
 
+Gap handling: each coin remembers the open_time of its last processed bar. Duplicate
+or stale bars are dropped. When a bar arrives after a gap (WS reconnect, host sleep,
+resume), the missing bars for *all* coins are fetched via REST and replayed in
+paper_backtest order (stable sort by open_time, ties in basket order) before the
+new bar is processed.
+
 See docs/2026-10-22-live-paper-design.md §3 and §7 for the full flow.
 """
 from __future__ import annotations
@@ -14,7 +20,7 @@ import time
 from pathlib import Path
 
 from martiquant.config import BasketConfig, LadderParams, RiskLimits
-from martiquant.market_data import Bar
+from martiquant.market_data import Bar, fetch_bars
 from martiquant.paper_broker import PaperBroker
 from martiquant.strategy import LadderStrategy
 
@@ -23,6 +29,8 @@ from .logger import LiveLogger
 from . import state as live_state
 
 logger = logging.getLogger(__name__)
+
+BAR_MS = 60_000
 
 
 class LiveRunner:
@@ -59,6 +67,8 @@ class LiveRunner:
         self.hour_last = -1
 
         self._round_tracker: dict[str, dict] = {}
+        self.last_bar_ms: dict[str, int] = {}
+        self._paused_last = False
 
         self.feed = WSFeed(list(basket.include), self.on_bar)
         self._stopping = False
@@ -68,7 +78,9 @@ class LiveRunner:
             restored = live_state.load(resume_from / "state.json",
                                        self.strategy, self.broker)
             if restored is not None:
-                self.totals, self.mark = restored
+                self.totals, self.mark, extra = restored
+                self.last_bar_ms = extra["last_bar_ms"]
+                self._round_tracker = extra["round_tracker"]
                 self.live_logger.event("resumed", from_dir=str(resume_from),
                                        totals=self.totals,
                                        open_coins=sum(1 for s in self.strategy.states.values()
@@ -80,76 +92,120 @@ class LiveRunner:
 
     async def on_bar(self, coin: str, bar: Bar) -> None:
         async with self._lock:
-            fills = self.broker.match_bar(coin, bar.high, bar.low, bar.open_time_ms)
+            last = self.last_bar_ms.get(coin)
+            if last is not None and bar.open_time_ms <= last:
+                return
+            if last is not None and bar.open_time_ms > last + BAR_MS:
+                await self._catch_up(bar.open_time_ms)
+            self._process_bar(coin, bar)
 
-            for f in fills:
-                was_open = self.strategy.states[coin].in_position
-                if f.side == "buy" and not was_open:
-                    self._round_tracker[coin] = {
-                        "open_time_ms": f.ts,
-                        "first_entry_px": f.px,
-                        "max_level": 1,
-                        "fee_paid": f.fee,
-                    }
+    async def _catch_up(self, until_ms: int) -> None:
+        """Fetch and replay every coin's missing bars with open_time < until_ms."""
+        gaps = {
+            c: last + BAR_MS
+            for c in self.basket.include
+            if (last := self.last_bar_ms.get(c)) is not None and last + BAR_MS < until_ms
+        }
+        bars: list[Bar] = []
+        n_by_coin: dict[str, int] = {}
+        try:
+            for c, start_ms in gaps.items():
+                got = await asyncio.to_thread(fetch_bars, c, start_ms, until_ms, "1m", False)
+                got = [b for b in got if start_ms <= b.open_time_ms < until_ms]
+                n_by_coin[c] = len(got)
+                bars.extend(got)
+        except Exception as e:
+            logger.exception("backfill fetch failed")
+            self.live_logger.event("backfill_failed", until_ms=until_ms,
+                                   gaps_from_ms=gaps, error=repr(e))
+            return
+        bars.sort(key=lambda b: b.open_time_ms)
+        for b in bars:
+            if b.open_time_ms > self.last_bar_ms[b.coin]:
+                self._process_bar(b.coin, b)
+        self.live_logger.event(
+            "backfill",
+            until_ms=until_ms,
+            gap_min={c: (until_ms - s) // BAR_MS for c, s in gaps.items()},
+            n_bars=n_by_coin,
+        )
 
-                pnl = self.strategy.on_fill(coin, f.side, f.px, f.qty, str(f.ts))
-                s_after = self.strategy.states[coin]
-                self.totals["price_pnl"] += pnl
-                self.totals["fee"] += f.fee
-                self.totals["n_fills"] += 1
+    def _process_bar(self, coin: str, bar: Bar) -> None:
+        fills = self.broker.match_bar(coin, bar.high, bar.low, bar.open_time_ms)
 
-                t = self._round_tracker.get(coin)
-                if t is not None and f.side == "buy" and was_open:
-                    t["max_level"] = max(t["max_level"], s_after.level)
-                    t["fee_paid"] += f.fee
-                if t is not None and f.side == "sell":
-                    t["fee_paid"] += f.fee
+        for f in fills:
+            was_open = self.strategy.states[coin].in_position
+            if f.side == "buy" and not was_open:
+                self._round_tracker[coin] = {
+                    "open_time_ms": f.ts,
+                    "first_entry_px": f.px,
+                    "max_level": 1,
+                    "fee_paid": f.fee,
+                }
 
-                self.live_logger.event(
-                    "fill", coin=coin, side=f.side, px=f.px, qty=f.qty,
-                    fee=f.fee, pnl=pnl, level=s_after.level,
-                    level_tag=f.level_tag,
-                )
+            pnl = self.strategy.on_fill(coin, f.side, f.px, f.qty, str(f.ts))
+            s_after = self.strategy.states[coin]
+            self.totals["price_pnl"] += pnl
+            self.totals["fee"] += f.fee
+            self.totals["n_fills"] += 1
 
-                self._maybe_deep_level_warn(coin, s_after.level)
+            t = self._round_tracker.get(coin)
+            if t is not None and f.side == "buy" and was_open:
+                t["max_level"] = max(t["max_level"], s_after.level)
+                t["fee_paid"] += f.fee
+            if t is not None and f.side == "sell":
+                t["fee_paid"] += f.fee
 
-                if f.side == "sell" and not s_after.in_position and t is not None:
-                    self.live_logger.round({
-                        "coin": coin,
-                        "open_time_ms": t["open_time_ms"],
-                        "close_time_ms": f.ts,
-                        "hold_hours": (f.ts - t["open_time_ms"]) / 3_600_000,
-                        "first_entry_px": t["first_entry_px"],
-                        "close_px": f.px,
-                        "max_level": t["max_level"],
-                        "price_pnl": pnl,
-                        "fee": t["fee_paid"],
-                        "realized_pnl": pnl + t["fee_paid"],
-                    })
-                    self.totals["n_rounds_closed"] += 1
-                    self._round_tracker.pop(coin, None)
+            self.live_logger.event(
+                "fill", coin=coin, side=f.side, px=f.px, qty=f.qty,
+                fee=f.fee, pnl=pnl, level=s_after.level,
+                level_tag=f.level_tag, bar_ms=f.ts,
+            )
 
-            self.mark[coin] = bar.close
-            hour_now = bar.open_time_ms // 3_600_000
+            self._maybe_deep_level_warn(coin, s_after.level)
 
-            if fills or hour_now != self.hour_last:
-                n_cx0 = self.broker.n_cancelled
-                n_pl0 = self.broker.n_placed
-                desired = self.strategy.desired_orders(self.mark)
-                self.broker.reconcile(desired)
-                self.live_logger.event(
-                    "reconcile",
-                    hour=hour_now,
-                    reason=("fill" if fills else "hour_turn"),
-                    n_desired=len(desired),
-                    n_placed=self.broker.n_placed - n_pl0,
-                    n_cancelled=self.broker.n_cancelled - n_cx0,
-                )
-                self.hour_last = hour_now
+            if f.side == "sell" and not s_after.in_position and t is not None:
+                self.live_logger.round({
+                    "coin": coin,
+                    "open_time_ms": t["open_time_ms"],
+                    "close_time_ms": f.ts,
+                    "hold_hours": (f.ts - t["open_time_ms"]) / 3_600_000,
+                    "first_entry_px": t["first_entry_px"],
+                    "close_px": f.px,
+                    "max_level": t["max_level"],
+                    "price_pnl": pnl,
+                    "fee": t["fee_paid"],
+                    "realized_pnl": pnl + t["fee_paid"],
+                })
+                self.totals["n_rounds_closed"] += 1
+                self._round_tracker.pop(coin, None)
 
-            paused, reason = self.strategy.should_pause_new_openings()
+        self.mark[coin] = bar.close
+        self.last_bar_ms[coin] = bar.open_time_ms
+        hour_now = bar.open_time_ms // 3_600_000
+
+        if fills or hour_now != self.hour_last:
+            n_cx0 = self.broker.n_cancelled
+            n_pl0 = self.broker.n_placed
+            desired = self.strategy.desired_orders(self.mark)
+            self.broker.reconcile(desired)
+            self.live_logger.event(
+                "reconcile",
+                hour=hour_now,
+                reason=("fill" if fills else "hour_turn"),
+                n_desired=len(desired),
+                n_placed=self.broker.n_placed - n_pl0,
+                n_cancelled=self.broker.n_cancelled - n_cx0,
+            )
+            self.hour_last = hour_now
+
+        paused, reason = self.strategy.should_pause_new_openings()
+        if paused != self._paused_last:
             if paused:
-                self.live_logger.event("circuit_pause", reason=reason)
+                self.live_logger.event("circuit_pause", reason=reason, bar_ms=bar.open_time_ms)
+            else:
+                self.live_logger.event("circuit_resume", bar_ms=bar.open_time_ms)
+            self._paused_last = paused
 
     def _maybe_deep_level_warn(self, coin: str, level: int) -> None:
         if level >= 4:
@@ -198,6 +254,7 @@ class LiveRunner:
                     live_state.dump(
                         self.run_dir / "state.json",
                         self.strategy, self.broker, self.totals, self.mark,
+                        self.last_bar_ms, self._round_tracker,
                     )
                     snap = self._compute_equity()
                     self.live_logger.equity_snapshot(snap)
@@ -274,6 +331,7 @@ class LiveRunner:
                 live_state.dump(
                     self.run_dir / "state.json",
                     self.strategy, self.broker, self.totals, self.mark,
+                    self.last_bar_ms, self._round_tracker,
                 )
                 self.live_logger.equity_snapshot(self._compute_equity())
             except Exception:

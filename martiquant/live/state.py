@@ -23,7 +23,8 @@ SCHEMA_VERSION = 1
 
 
 def dump(path: Path, strategy: LadderStrategy, broker: PaperBroker,
-         totals: dict[str, float], mark: dict[str, float]) -> None:
+         totals: dict[str, float], mark: dict[str, float],
+         last_bar_ms: dict[str, int], round_tracker: dict[str, dict]) -> None:
     payload = {
         "schema": SCHEMA_VERSION,
         "ts_ms": int(time.time() * 1000),
@@ -36,6 +37,8 @@ def dump(path: Path, strategy: LadderStrategy, broker: PaperBroker,
         },
         "totals": totals,
         "mark": mark,
+        "last_bar_ms": last_bar_ms,
+        "round_tracker": round_tracker,
     }
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, indent=2, default=str))
@@ -43,8 +46,12 @@ def dump(path: Path, strategy: LadderStrategy, broker: PaperBroker,
 
 
 def load(path: Path, strategy: LadderStrategy, broker: PaperBroker,
-         max_age_sec: int = 3600) -> tuple[dict[str, float], dict[str, float]] | None:
-    """Restore state into strategy + broker. Returns (totals, mark) or None if stale."""
+         max_age_sec: int = 3600) -> tuple[dict[str, float], dict[str, float], dict] | None:
+    """Restore state into strategy + broker.
+
+    Returns (totals, mark, extra) or None if stale. `extra` holds last_bar_ms and
+    round_tracker; snapshots written before those keys existed restore them as empty.
+    """
     if not path.exists():
         logger.info("state.json not found at %s", path)
         return None
@@ -78,7 +85,11 @@ def load(path: Path, strategy: LadderStrategy, broker: PaperBroker,
 
     totals = dict(payload["totals"])
     mark = dict(payload["mark"])
+    extra = {
+        "last_bar_ms": {c: int(t) for c, t in payload.get("last_bar_ms", {}).items()},
+        "round_tracker": dict(payload.get("round_tracker", {})),
+    }
     logger.info("state restored, age=%.0fs, open_orders=%d, open_coins=%d",
                 age_sec, len(broker.open_orders),
                 sum(1 for s in strategy.states.values() if s.in_position))
-    return totals, mark
+    return totals, mark, extra
