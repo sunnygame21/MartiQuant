@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.env
+.env.*
+!.env.example
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+.DS_Store
+/tmp_*
+/scratch/
+
+# generated artifacts / private source data
+/runs/
+/basket_scoring/runs/
+/okx-export/

@@ -1,0 +1,30 @@
+[project]
+name = "martiquant"
+version = "0.1.0"
+description = "Martingale ladder strategy, reverse-engineered from OKX source account, retargeted for Binance USDT-M perpetuals"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas>=2.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+binance = [
+    "python-binance>=1.0.19",
+    "websockets>=12",
+]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+]
+research = [
+    "numba>=0.61",
+    "matplotlib>=3.9",
+]
+
+[tool.setuptools.packages.find]
+include = ["martiquant*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
