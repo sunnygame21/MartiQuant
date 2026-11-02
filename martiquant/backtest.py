@@ -16,7 +16,8 @@ On top of that it evaluates the risk controls under study:
                  no slippage) once the contract is delisted.
 
 Reported max drawdown is always measured from the all-time equity peak; only the
-stop rule uses the reset peak.
+stop rule uses the reset peak. max_dd_pct uses every bar (catches minute-scale
+flash-crash wicks); max_dd_hourly_pct samples equity once per hour.
 """
 from __future__ import annotations
 
@@ -73,6 +74,8 @@ def run(cfg: BacktestConfig, stream: tuple[list, ...]) -> dict:
     price_pnl = fee_total = 0.0
     peak = stop_peak = cfg.equity_usd
     max_dd = worst_upl = max_committed = 0.0
+    max_dd_ts = 0
+    peak_h, max_dd_h, hour_sampled = cfg.equity_usd, 0.0, -1
     hour_last = -1
     halted_until: float | None = None
     pause_ticks = n_bars = 0
@@ -159,7 +162,12 @@ def run(cfg: BacktestConfig, stream: tuple[list, ...]) -> dict:
         peak = max(peak, eq)
         stop_peak = max(stop_peak, eq)
         dd = (eq / peak - 1) * 100
-        max_dd = min(max_dd, dd)
+        if dd < max_dd:
+            max_dd, max_dd_ts = dd, ts
+        if hour != hour_sampled:  # equity at each hour's first bar: ignores minute-scale wicks
+            hour_sampled = hour
+            peak_h = max(peak_h, eq)
+            max_dd_h = min(max_dd_h, (eq / peak_h - 1) * 100)
         max_committed = max(max_committed, sum(x.cost_basis_usd for x in strat.states.values()))
         if strat.should_pause_new_openings()[0]:
             pause_ticks += 1
@@ -200,6 +208,8 @@ def run(cfg: BacktestConfig, stream: tuple[list, ...]) -> dict:
         "open_upl": final_upl,
         "worst_upl_during": worst_upl,
         "max_dd_pct": max_dd,
+        "max_dd_ts_ms": max_dd_ts,
+        "max_dd_hourly_pct": max_dd_h,
         "peak_eq": peak,
         "max_committed_usd": max_committed,
         "rounds_closed": len(rounds),
