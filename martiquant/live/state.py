@@ -2,7 +2,10 @@
 
 Design (per 2026-10-22-live-paper-design.md §6.4):
   - dumped every 60s during normal running
-  - loaded only on explicit --resume-from, and only if snapshot age < max_age_sec
+  - loaded only on explicit --resume-from (run.sh watch passes the tag's newest one)
+  - snapshots with per-coin last_bar_ms load at any age: the runner replays the gap
+    from REST, so a resume equals an uninterrupted run. Older snapshots without it
+    can't be replayed and are only trusted if younger than max_age_sec.
   - append-only logs (events.jsonl / rounds.csv) are crash-safe independently
 """
 from __future__ import annotations
@@ -67,8 +70,10 @@ def load(path: Path, strategy: LadderStrategy, broker: PaperBroker,
         return None
 
     age_sec = (time.time() * 1000 - payload["ts_ms"]) / 1000
-    if age_sec > max_age_sec:
-        logger.warning("state.json too old (%.0fs > %ds), cold start", age_sec, max_age_sec)
+    replayable = set(payload.get("last_bar_ms", {})) >= set(payload["strategy_states"])
+    if age_sec > max_age_sec and not replayable:
+        logger.warning("state.json too old (%.0fs > %ds) and has no last_bar_ms to replay "
+                       "the gap, cold start", age_sec, max_age_sec)
         return None
 
     for coin, s_dict in payload["strategy_states"].items():

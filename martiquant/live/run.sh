@@ -128,7 +128,7 @@ watch() {
         pf=$(pidfile "$tag"); lf=$(logfile "$tag")
         if alive "$pf"; then continue; fi
         # Resume from this tag's newest state.json (glob sorts by run timestamp); a plain
-        # relaunch would cold-start and drop open ladders. state.load still refuses >1h old.
+        # relaunch would cold-start and drop open ladders. The runner replays the downtime.
         cmd=$(sed -E 's/ --resume-from [^ ]+//' "$cf")
         states=(runs/live_????????T??????Z_"$tag"/state.json)
         if [ ${#states[@]} -gt 0 ]; then
