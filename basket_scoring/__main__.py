@@ -1,5 +1,5 @@
-"""CLI entry: hard-gate young listings → compute metrics across 365/180/90d
-windows → percentile-rank within each window → combine → persist.
+"""CLI entry: hard-gate candidates (young or delisted listings) → compute metrics
+across 365/180/90d windows → percentile-rank within each window → combine → persist.
 
 Usage:
   python3 -m basket_scoring
@@ -14,6 +14,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+from martiquant import archive
 from martiquant.market_data import fetch_bars
 
 from .candidates import (
@@ -21,14 +22,10 @@ from .candidates import (
     BENCHMARK,
     CURRENT_BASKET,
     MIN_ONBOARD_AGE_DAYS,
-    fetch_onboard_dates,
+    fetch_symbol_info,
 )
-from .metrics import btc_daily_returns, compute_metrics
+from .pipeline import DEFAULT_WINDOWS, gate, score_as_of
 from .report import write_raw_metrics_csv, write_scores_csv, write_summary
-from .score import DEFAULT_WINDOW_WEIGHTS, score_multi
-
-
-DEFAULT_WINDOWS = (365, 180, 90)
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,33 +34,13 @@ def parse_args() -> argparse.Namespace:
                     help="Target basket size (default 10)")
     ap.add_argument("--interval", default="1h", choices=["1h", "1m"],
                     help="Kline interval (1h recommended)")
+    ap.add_argument("--source", default="api", choices=["api", "archive"],
+                    help="archive: 1h bars aggregated from data/klines_1m (no fapi weight), "
+                         "scored as of the newest archived bar")
     ap.add_argument("--runs-dir",
                     default=str(Path(__file__).resolve().parent / "runs"),
                     help="Where to write artifacts")
     return ap.parse_args()
-
-
-def _apply_onboard_gate(candidates: tuple[str, ...]) -> tuple[list[str], dict[str, int]]:
-    """Return (approved coins, {rejected coin: listed days})."""
-    now_ms = int(time.time() * 1000)
-    try:
-        onboard = fetch_onboard_dates()
-    except Exception:
-        print("WARN: could not fetch onboard dates; skipping age gate", file=sys.stderr)
-        return list(candidates), {}
-    approved: list[str] = []
-    rejected: dict[str, int] = {}
-    for coin in candidates:
-        onboard_ms = onboard.get(coin, 0)
-        if onboard_ms == 0:
-            rejected[coin] = 0
-            continue
-        age_days = (now_ms - onboard_ms) / 86_400_000
-        if age_days >= MIN_ONBOARD_AGE_DAYS:
-            approved.append(coin)
-        else:
-            rejected[coin] = int(age_days)
-    return approved, rejected
 
 
 def main() -> int:
@@ -72,58 +49,34 @@ def main() -> int:
                         datefmt="%H:%M:%S")
     args = parse_args()
 
-    print(f"Hard gate: Binance USDT-M listed >= {MIN_ONBOARD_AGE_DAYS} days")
-    approved, rejected = _apply_onboard_gate(ALL_CANDIDATES)
+    end_ms = (archive.last_bar_ms(BENCHMARK) + 60_000 if args.source == "archive"
+              else int(time.time() * 1000))
+    print(f"Hard gates: Binance USDT-M listed >= {MIN_ONBOARD_AGE_DAYS} days, not delisted")
+    try:
+        info = fetch_symbol_info()
+    except Exception as e:
+        print(f"ERROR: exchangeInfo unavailable, refusing to score without gates: {e!r}",
+              file=sys.stderr)
+        return 1
+    approved, rejected = gate(ALL_CANDIDATES, info, end_ms)
     print(f"  approved: {len(approved)}  rejected: {len(rejected)} "
-          f"({', '.join(f'{c}({d}d)' for c, d in rejected.items()) if rejected else '-'})")
+          f"({', '.join(f'{c} ({r})' for c, r in rejected.items()) if rejected else '-'})")
     print()
-    if BENCHMARK not in approved and BENCHMARK in ALL_CANDIDATES:
-        approved.append(BENCHMARK)
 
-    end_ms = int(time.time() * 1000)
-    max_days = max(DEFAULT_WINDOWS)
-    start_ms = end_ms - max_days * 86_400_000
-
-    print(f"Fetching {BENCHMARK} (benchmark + candidate)...")
-    btc_bars_all = fetch_bars(BENCHMARK, start_ms, end_ms, args.interval)
-    print(f"  {len(btc_bars_all):,} bars")
-    if len(btc_bars_all) < 100:
+    start_ms = end_ms - max(DEFAULT_WINDOWS) * 86_400_000
+    coin_bars: dict[str, list] = {}
+    for coin in dict.fromkeys([BENCHMARK, *approved]):
+        print(f"Fetching {coin}...", end="", flush=True)
+        coin_bars[coin] = (archive.hourly_bars(coin, start_ms, end_ms) if args.source == "archive"
+                           else fetch_bars(coin, start_ms, end_ms, args.interval))
+        print(f" {len(coin_bars[coin]):,} bars")
+    if len(coin_bars[BENCHMARK]) < 100:
         print("ERROR: too few BTC bars", file=sys.stderr)
         return 1
 
-    coin_bars: dict[str, list] = {BENCHMARK: btc_bars_all}
-    for coin in approved:
-        if coin == BENCHMARK:
-            continue
-        print(f"Fetching {coin}...", end="", flush=True)
-        bars = fetch_bars(coin, start_ms, end_ms, args.interval)
-        print(f" {len(bars):,} bars")
-        if len(bars) >= 100:
-            coin_bars[coin] = bars
-
-    metrics_by_window: dict[int, list] = {}
-    for days in DEFAULT_WINDOWS:
-        win_start = end_ms - days * 86_400_000
-        btc_win = [b for b in btc_bars_all if b.open_time_ms >= win_start]
-        btc_days_ret, btc_rets = btc_daily_returns(btc_win)
-        win_metrics = []
-        for coin, bars in coin_bars.items():
-            win_bars = [b for b in bars if b.open_time_ms >= win_start]
-            if len(win_bars) < 24 * days * 0.9:
-                continue
-            if coin == BENCHMARK and len(approved) == 0:
-                continue
-            if coin not in approved and coin != BENCHMARK:
-                continue
-            win_metrics.append(
-                compute_metrics(coin, win_bars, btc_days_ret, btc_rets)
-            )
-        if BENCHMARK not in approved:
-            win_metrics = [m for m in win_metrics if m.coin != BENCHMARK]
-        metrics_by_window[days] = win_metrics
-        print(f"  window {days}d: {len(win_metrics)} coins passed data check")
-
-    scored = score_multi(metrics_by_window, DEFAULT_WINDOW_WEIGHTS)
+    scored, metrics_by_window = score_as_of(coin_bars, approved, end_ms)
+    for days, mlist in metrics_by_window.items():
+        print(f"  window {days}d: {len(mlist)} coins passed data check")
 
     now_iso = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_dir = Path(args.runs_dir) / now_iso

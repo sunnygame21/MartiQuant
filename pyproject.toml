@@ -25,6 +25,9 @@ research = [
 [tool.setuptools.packages.find]
 include = ["martiquant*"]
 
+[tool.pytest.ini_options]
+pythonpath = ["."]  # basket_scoring/ is run in place (python3 -m basket_scoring), not installed
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"

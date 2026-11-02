@@ -16,6 +16,7 @@ build/
 /scratch/
 
 # generated artifacts / private source data
+/data/
 /runs/
 /basket_scoring/runs/
 /okx-export/

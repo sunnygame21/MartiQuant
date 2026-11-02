@@ -47,7 +47,7 @@ def write_raw_metrics_csv(path: Path, scored: list[ScoredCoin]) -> None:
 def write_summary(
     path: Path,
     scored: list[ScoredCoin],
-    rejected_young: dict[str, int],
+    rejected: dict[str, str],
     n_top: int = 10,
 ) -> None:
     windows = sorted({d for s in scored for d in s.per_window}, reverse=True)
@@ -60,16 +60,16 @@ def write_summary(
     lines.append("")
     lines.append(f"**Windows**: {windows} days (1h klines, equal percentile within each)")
     lines.append(f"**Candidates passed hard gate**: {len(scored)}  "
-                 f"**Rejected (young listing)**: {len(rejected_young)}  "
+                 f"**Rejected by hard gates**: {len(rejected)}  "
                  f"**Basket size**: {n_top}")
     lines.append("")
-    if rejected_young:
-        lines.append("## Rejected by onboard-age hard gate")
+    if rejected:
+        lines.append("## Rejected by hard gates")
         lines.append("")
-        lines.append("| coin | listed days | reason |")
-        lines.append("|---|---|---|")
-        for coin, days in sorted(rejected_young.items(), key=lambda kv: kv[1]):
-            lines.append(f"| {coin} | {days} | Binance USDT-M listing too young |")
+        lines.append("| coin | reason |")
+        lines.append("|---|---|")
+        for coin, reason in sorted(rejected.items()):
+            lines.append(f"| {coin} | {reason} |")
         lines.append("")
     lines.append("## Recommended basket")
     lines.append("")

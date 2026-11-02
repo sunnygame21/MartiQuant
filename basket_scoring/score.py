@@ -45,14 +45,20 @@ class ScoredCoin:
 
 
 def _percentile_rank(values: np.ndarray, higher_is_better: bool) -> np.ndarray:
-    order = values.argsort()
+    """0-100 rank, 100 = best. Equal values share their mean position.
+
+    Ties are common in the integer metrics (e.g. several coins underwater for the
+    whole 365d window); breaking them by input order made scores order-dependent.
+    """
+    v = np.asarray(values, dtype=np.float64)
     if not higher_is_better:
-        order = order[::-1]
-    ranks = np.empty_like(values, dtype=np.float64)
-    n = len(values)
-    for i, idx in enumerate(order):
-        ranks[idx] = (i / max(n - 1, 1)) * 100.0
-    return ranks
+        v = -v
+    pos = np.empty(len(v), dtype=np.float64)
+    pos[np.argsort(v, kind="stable")] = np.arange(len(v))
+    for val in np.unique(v):
+        tied = v == val
+        pos[tied] = pos[tied].mean()
+    return pos / max(len(v) - 1, 1) * 100.0
 
 
 def _score_one_window(metrics: list[RawMetrics]) -> dict[str, WindowScore]:
