@@ -83,6 +83,20 @@ class PaperBroker:
             self._next_id += 1
             self.n_placed += 1
 
+    def market_sell(self, coin: str, qty: float, mark_px: float, ts_ms: int,
+                    taker_fee_rate: float, slippage: float) -> SimFill:
+        """Simulated market sell of a whole position (risk stop, delisting).
+
+        Fills at mark * (1 - slippage) as taker and cancels the coin's resting orders.
+        level_tag -1 marks it as a forced exit rather than a take-profit.
+        """
+        for oid in [oid for oid, o in self.open_orders.items() if o.coin == coin]:
+            del self.open_orders[oid]
+            self.n_cancelled += 1
+        px = mark_px * (1.0 - slippage)
+        return SimFill(coin=coin, side="sell", px=px, qty=qty,
+                       fee=-px * qty * taker_fee_rate, ts=ts_ms, level_tag=-1)
+
     def match_bar(self, coin: str, high: float, low: float, ts_ms: int) -> list[SimFill]:
         fills: list[SimFill] = []
         remove: list[int] = []

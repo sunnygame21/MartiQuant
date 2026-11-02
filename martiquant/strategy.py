@@ -70,6 +70,14 @@ class LadderStrategy:
         self.first_entry_usd = first_entry_usd
         self.states: dict[str, CoinState] = {c: CoinState(c) for c in basket.include}
 
+    def set_basket(self, include: tuple[str, ...]) -> None:
+        """Switch the traded coins. A dropped coin with an open round keeps its TP and
+        ladder until the round closes, then opens nothing new; a flat one goes quiet now.
+        """
+        self.basket = BasketConfig(include=include)
+        for coin in include:
+            self.states.setdefault(coin, CoinState(coin))
+
     # ------------------------------------------------------------------ risk
 
     def should_pause_new_openings(self) -> tuple[bool, str]:
@@ -91,14 +99,13 @@ class LadderStrategy:
         paused, _ = self.should_pause_new_openings()
         orders: list[DesiredOrder] = []
         for coin, s in self.states.items():
-            if not self.basket.is_tradeable(coin):
-                continue
             px = mark_px.get(coin)
             if px is None or px <= 0:
                 continue
 
             if not s.in_position:
-                if paused:
+                # Coins outside the basket only finish the round they're in (see set_basket).
+                if paused or not self.basket.is_tradeable(coin):
                     continue
                 qty = self.first_entry_usd / px
                 orders.append(DesiredOrder(coin, "buy", px, qty, False, level_tag=1))
