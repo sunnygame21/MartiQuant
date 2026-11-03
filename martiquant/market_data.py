@@ -73,6 +73,32 @@ def fetch_klines_page(
     return _get_json(url)
 
 
+def fetch_symbol_info() -> dict[str, dict[str, int | str]]:
+    """Return {coin: {onboard_ms, delivery_ms, status}} for USDT-M perpetuals.
+
+    Fetched fresh on every call: a cached copy is exactly what hides a delisting.
+    Live perpetuals carry a far-future deliveryDate (2100); a delisted or
+    delisting-announced one carries its settlement time. Request weight 1.
+    """
+    payload = _get_json(f"{BINANCE_FUTURES_REST}/fapi/v1/exchangeInfo", retries=2)
+    result: dict[str, dict[str, int | str]] = {}
+    for sym in payload.get("symbols", []):
+        if sym.get("contractType") != "PERPETUAL" or sym.get("quoteAsset") != "USDT":
+            continue
+        base = sym.get("baseAsset")
+        if base and sym.get("onboardDate"):
+            result[base] = {
+                "onboard_ms": int(sym["onboardDate"]),
+                "delivery_ms": int(sym.get("deliveryDate") or LIVE_PERP_DELIVERY_MS),
+                "status": sym.get("status", ""),
+            }
+    return result
+
+
+# Live perpetuals report deliveryDate 4133404800000 (2100-12-25); anything earlier is
+# a scheduled or past settlement.
+LIVE_PERP_DELIVERY_MS = 4_133_404_800_000
+
 # 1m interval = 60_000 ms per bar
 _INTERVAL_MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000}
 

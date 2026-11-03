@@ -8,6 +8,10 @@ run.sh remembers (runs/_live_logs/<tag>.cmd) it checks:
               (process dead and not coming back, or hung)
   no_bars     no coin has a processed bar newer than STALE_SEC
               (feed down and the REST backfill isn't closing the gap)
+  delisted    a basket coin's perpetual has a settlement scheduled or past, or no
+              longer exists (exchangeInfo, at most once per DELIST_CHECK_SEC). The
+              feed keeps streaming flat zero-volume bars for a settled contract, so
+              no_bars never fires for it and the paper sits on a dead position.
   backfill_failed / resume_skipped events appended since the last check
 
 A check alerts once when it goes bad and once when it recovers; events alert each
@@ -31,6 +35,8 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+from martiquant.market_data import LIVE_PERP_DELIVERY_MS, fetch_symbol_info
+
 ROOT = Path(__file__).resolve().parent.parent.parent
 LIVE_LOGS = ROOT / "runs" / "_live_logs"
 STATE_FILE = LIVE_LOGS / "monitor_state.json"
@@ -38,6 +44,7 @@ LOG_FILE = LIVE_LOGS / "monitor.log"
 
 STALE_SEC = 300
 CRASH_LOOP_RESTARTS = 3
+DELIST_CHECK_SEC = 3600  # delistings are announced days ahead; hourly is plenty
 WATCH_LINE = re.compile(r"^\[watch (\S+)\] \[(\S+)\] dead, restarting")
 ALERT_EVENTS = ("backfill_failed", "resume_skipped")
 
@@ -57,6 +64,27 @@ def _env(name: str) -> str | None:
 def _latest_run_dir(runs_dir: Path, tag: str) -> Path | None:
     dirs = sorted(runs_dir.glob(f"live_????????T??????Z_{tag}"))
     return dirs[-1] if dirs else None
+
+
+def delist_problem(coins: list[str], info: dict[str, dict], now: float) -> str | None:
+    """Describe basket coins whose perpetual is settling/settled or gone, else None."""
+    problems = []
+    for coin in coins:
+        s = info.get(coin)
+        if s is None:
+            problems.append(f"{coin} has no USDT-M perpetual")
+        elif s["delivery_ms"] < LIVE_PERP_DELIVERY_MS:
+            day = datetime.fromtimestamp(s["delivery_ms"] / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            verb = "settled" if s["delivery_ms"] <= now * 1000 else "settles"
+            problems.append(f"{coin} {verb} {day} ({s['status']})")
+    return "; ".join(problems) or None
+
+
+def _basket(run_dir: Path | None) -> list[str]:
+    try:
+        return list(json.loads((run_dir / "config.json").read_text())["basket"])
+    except (TypeError, OSError, KeyError, json.JSONDecodeError):
+        return []
 
 
 def _recent_restarts(log: Path, tag: str, now: float) -> int:
@@ -154,11 +182,22 @@ def run(runs_dir: Path = ROOT / "runs", now: float | None = None) -> list[str]:
             if run_dir and (run_dir / "events.jsonl").exists():
                 offsets[str(run_dir / "events.jsonl")] = (run_dir / "events.jsonl").stat().st_size
 
+    info = None
+    delist_checked_at = prev.get("delist_checked_at", 0)
+    if now - delist_checked_at >= DELIST_CHECK_SEC:
+        try:
+            info = fetch_symbol_info()
+            delist_checked_at = now
+        except Exception:
+            info = None  # retry next run; keep the last verdict meanwhile
+
     messages: list[str] = []
     for cmd in sorted(live_logs.glob("*.cmd")):
         tag = cmd.stem
         checks, events = check_tag(runs_dir, tag, now, offsets)
         was = bad.get(tag, {})
+        checks["delisted"] = (delist_problem(_basket(_latest_run_dir(runs_dir, tag)), info, now)
+                              if info is not None else was.get("delisted"))
         now_bad = {k: v for k, v in checks.items() if v}
         for k, v in now_bad.items():
             if k not in was:
@@ -176,7 +215,8 @@ def run(runs_dir: Path = ROOT / "runs", now: float | None = None) -> list[str]:
         for msg in messages:
             log.write(f"[{stamp}] {msg} ({send(msg)})\n")
     tmp = state_file.with_suffix(".tmp")
-    tmp.write_text(json.dumps({"bad": bad, "offsets": offsets}, indent=2))
+    tmp.write_text(json.dumps({"bad": bad, "offsets": offsets,
+                               "delist_checked_at": delist_checked_at}, indent=2))
     tmp.replace(state_file)
     return messages
 

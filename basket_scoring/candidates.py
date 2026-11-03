@@ -19,8 +19,7 @@ must be allowed to disagree with that in-sample judgment on data grounds.
 """
 from __future__ import annotations
 
-import json
-import urllib.request
+from martiquant.market_data import fetch_symbol_info  # noqa: F401  (re-exported for callers)
 
 MIN_ONBOARD_AGE_DAYS = 730  # need >= 2 years of Binance USDT-M history
 
@@ -38,30 +37,3 @@ ADDITIONAL_CANDIDATES = (
 
 ALL_CANDIDATES = CURRENT_BASKET + ADDITIONAL_CANDIDATES
 BENCHMARK = "BTC"
-
-
-_EXCHANGE_INFO_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo"
-
-
-def fetch_symbol_info() -> dict[str, dict[str, int | str]]:
-    """Return {coin: {onboard_ms, delivery_ms, status}} for USDT-M perpetuals.
-
-    Fetched fresh on every call: a cached copy is exactly what hides a delisting.
-    Live perpetuals carry a far-future deliveryDate; delisted ones the settle time.
-    """
-    req = urllib.request.Request(_EXCHANGE_INFO_URL,
-                                 headers={"User-Agent": "martiquant/0.1"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        payload = json.loads(r.read())
-    result: dict[str, dict[str, int | str]] = {}
-    for sym in payload.get("symbols", []):
-        if sym.get("contractType") != "PERPETUAL" or sym.get("quoteAsset") != "USDT":
-            continue
-        base = sym.get("baseAsset")
-        if base and sym.get("onboardDate"):
-            result[base] = {
-                "onboard_ms": int(sym["onboardDate"]),
-                "delivery_ms": int(sym.get("deliveryDate") or 4_133_404_800_000),
-                "status": sym.get("status", ""),
-            }
-    return result
