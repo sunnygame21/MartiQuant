@@ -21,7 +21,7 @@ from pathlib import Path
 
 from martiquant.config import BasketConfig, LadderParams, RiskLimits
 from martiquant.market_data import Bar, fetch_bars
-from martiquant.paper_broker import PaperBroker
+from martiquant.paper_broker import PaperBroker, SimFill
 from martiquant.strategy import LadderStrategy
 
 from .feed import WSFeed
@@ -31,6 +31,7 @@ from . import state as live_state
 logger = logging.getLogger(__name__)
 
 BAR_MS = 60_000
+SETTLE_FEE_RATE = 0.0005  # Binance VIP0 taker; same as backtest delisting settlement
 
 
 class LiveRunner:
@@ -44,6 +45,7 @@ class LiveRunner:
         maker_fee_bps: float,
         run_dir: Path,
         resume_from: Path | None = None,
+        settle: tuple[str, ...] = (),
     ) -> None:
         self.params = params
         self.basket = basket
@@ -81,6 +83,7 @@ class LiveRunner:
                 self.totals, self.mark, extra = restored
                 self.last_bar_ms = extra["last_bar_ms"]
                 self._round_tracker = extra["round_tracker"]
+                self._settle_dropped(settle)
                 self.live_logger.event("resumed", from_dir=str(resume_from),
                                        totals=self.totals,
                                        open_coins=sum(1 for s in self.strategy.states.values()
@@ -130,55 +133,85 @@ class LiveRunner:
             n_bars=n_by_coin,
         )
 
+    def _settle_dropped(self, settle: tuple[str, ...]) -> None:
+        """Handle coins in the resumed snapshot that are no longer in --basket.
+
+        A flat one just leaves. An open round is closed at its last mark (taker fee,
+        like an exchange delisting settlement) only if the coin is named in `settle`;
+        otherwise refuse to start rather than silently drop the position and its P&L.
+        """
+        dropped = [c for c in self.strategy.states if c not in self.basket.include]
+        stuck = [c for c in dropped if self.strategy.states[c].in_position and c not in settle]
+        if stuck:
+            raise SystemExit(f"open rounds in {stuck} but they are not in --basket; "
+                             f"add them back or pass --settle {','.join(stuck)}")
+        for coin in dropped:
+            s = self.strategy.states[coin]
+            if s.in_position:
+                ts = self.last_bar_ms.get(coin, int(time.time() * 1000))
+                f = self.broker.market_sell(coin, s.position_coin, self.mark[coin], ts,
+                                            SETTLE_FEE_RATE, 0.0)
+                self._apply_fill(coin, f)
+                self.live_logger.event("settled", coin=coin, px=f.px, qty=f.qty, fee=f.fee)
+            for oid in [oid for oid, o in self.broker.open_orders.items() if o.coin == coin]:
+                del self.broker.open_orders[oid]
+                self.broker.n_cancelled += 1
+            del self.strategy.states[coin]
+            self.mark.pop(coin, None)
+            self.last_bar_ms.pop(coin, None)
+            self._round_tracker.pop(coin, None)
+
+    def _apply_fill(self, coin: str, f: SimFill) -> None:
+        was_open = self.strategy.states[coin].in_position
+        if f.side == "buy" and not was_open:
+            self._round_tracker[coin] = {
+                "open_time_ms": f.ts,
+                "first_entry_px": f.px,
+                "max_level": 1,
+                "fee_paid": f.fee,
+            }
+
+        pnl = self.strategy.on_fill(coin, f.side, f.px, f.qty, str(f.ts))
+        s_after = self.strategy.states[coin]
+        self.totals["price_pnl"] += pnl
+        self.totals["fee"] += f.fee
+        self.totals["n_fills"] += 1
+
+        t = self._round_tracker.get(coin)
+        if t is not None and f.side == "buy" and was_open:
+            t["max_level"] = max(t["max_level"], s_after.level)
+            t["fee_paid"] += f.fee
+        if t is not None and f.side == "sell":
+            t["fee_paid"] += f.fee
+
+        self.live_logger.event(
+            "fill", coin=coin, side=f.side, px=f.px, qty=f.qty,
+            fee=f.fee, pnl=pnl, level=s_after.level,
+            level_tag=f.level_tag, bar_ms=f.ts,
+        )
+
+        self._maybe_deep_level_warn(coin, s_after.level)
+
+        if f.side == "sell" and not s_after.in_position and t is not None:
+            self.live_logger.round({
+                "coin": coin,
+                "open_time_ms": t["open_time_ms"],
+                "close_time_ms": f.ts,
+                "hold_hours": (f.ts - t["open_time_ms"]) / 3_600_000,
+                "first_entry_px": t["first_entry_px"],
+                "close_px": f.px,
+                "max_level": t["max_level"],
+                "price_pnl": pnl,
+                "fee": t["fee_paid"],
+                "realized_pnl": pnl + t["fee_paid"],
+            })
+            self.totals["n_rounds_closed"] += 1
+            self._round_tracker.pop(coin, None)
+
     def _process_bar(self, coin: str, bar: Bar) -> None:
         fills = self.broker.match_bar(coin, bar.high, bar.low, bar.open_time_ms)
-
         for f in fills:
-            was_open = self.strategy.states[coin].in_position
-            if f.side == "buy" and not was_open:
-                self._round_tracker[coin] = {
-                    "open_time_ms": f.ts,
-                    "first_entry_px": f.px,
-                    "max_level": 1,
-                    "fee_paid": f.fee,
-                }
-
-            pnl = self.strategy.on_fill(coin, f.side, f.px, f.qty, str(f.ts))
-            s_after = self.strategy.states[coin]
-            self.totals["price_pnl"] += pnl
-            self.totals["fee"] += f.fee
-            self.totals["n_fills"] += 1
-
-            t = self._round_tracker.get(coin)
-            if t is not None and f.side == "buy" and was_open:
-                t["max_level"] = max(t["max_level"], s_after.level)
-                t["fee_paid"] += f.fee
-            if t is not None and f.side == "sell":
-                t["fee_paid"] += f.fee
-
-            self.live_logger.event(
-                "fill", coin=coin, side=f.side, px=f.px, qty=f.qty,
-                fee=f.fee, pnl=pnl, level=s_after.level,
-                level_tag=f.level_tag, bar_ms=f.ts,
-            )
-
-            self._maybe_deep_level_warn(coin, s_after.level)
-
-            if f.side == "sell" and not s_after.in_position and t is not None:
-                self.live_logger.round({
-                    "coin": coin,
-                    "open_time_ms": t["open_time_ms"],
-                    "close_time_ms": f.ts,
-                    "hold_hours": (f.ts - t["open_time_ms"]) / 3_600_000,
-                    "first_entry_px": t["first_entry_px"],
-                    "close_px": f.px,
-                    "max_level": t["max_level"],
-                    "price_pnl": pnl,
-                    "fee": t["fee_paid"],
-                    "realized_pnl": pnl + t["fee_paid"],
-                })
-                self.totals["n_rounds_closed"] += 1
-                self._round_tracker.pop(coin, None)
+            self._apply_fill(coin, f)
 
         self.mark[coin] = bar.close
         self.last_bar_ms[coin] = bar.open_time_ms

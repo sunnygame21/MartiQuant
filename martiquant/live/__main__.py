@@ -51,6 +51,12 @@ def parse_args() -> argparse.Namespace:
         "--resume-from", type=Path, default=None,
         help="Resume state from a previous run directory (uses its state.json)",
     )
+    ap.add_argument(
+        "--settle", default="",
+        help="Comma-separated coins dropped from --basket whose open rounds should be "
+             "closed at their last price on resume (e.g. a delisted contract). Without it, "
+             "resuming refuses to drop a coin that still has an open round.",
+    )
     return ap.parse_args()
 
 
@@ -101,6 +107,7 @@ def main() -> int:
         "risk_deep_level": risk.deep_level,
         "risk_max_coins_at_deep": risk.max_coins_at_deep_level,
         "resume_from": str(args.resume_from) if args.resume_from else None,
+        "settle": args.settle or None,
     }
     (run_dir / "config.json").write_text(json.dumps(config_dump, indent=2))
 
@@ -120,6 +127,7 @@ def main() -> int:
         maker_fee_bps=args.maker_fee_bps,
         run_dir=run_dir,
         resume_from=args.resume_from,
+        settle=tuple(c.strip().upper() for c in args.settle.split(",") if c.strip()),
     )
 
     try:

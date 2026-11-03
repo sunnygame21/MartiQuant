@@ -76,9 +76,10 @@ def load(path: Path, strategy: LadderStrategy, broker: PaperBroker,
                        "the gap, cold start", age_sec, max_age_sec)
         return None
 
+    # Restore every coin, including ones since removed from the basket: the runner
+    # decides what happens to their open rounds (LiveRunner._settle_dropped).
     for coin, s_dict in payload["strategy_states"].items():
-        if coin in strategy.states:
-            strategy.states[coin] = CoinState(**s_dict)
+        strategy.states[coin] = CoinState(**s_dict)
 
     broker._next_id = payload["broker"]["next_id"]
     broker.n_placed = payload["broker"]["n_placed"]
