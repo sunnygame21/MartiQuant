@@ -27,7 +27,7 @@ from martiquant.backtest import DAY_MS, BacktestConfig, merge_bars, run  # noqa:
 from martiquant.config import A_PERIOD, B_PERIOD, DEFAULT_BASKET, DEFAULT_RISK  # noqa: E402
 
 
-ARTIFACTS = ("rounds", "stops", "deep_stops", "equity_daily")  # written as CSV, not in summary
+ARTIFACTS = ("rounds", "stops", "deep_stops", "equity_daily", "equity_hourly")  # CSV, not summary
 
 
 def _ms(s: str) -> int:

@@ -95,6 +95,9 @@ def run(cfg: BacktestConfig, stream: tuple[list, ...]) -> dict:
     equity_daily: list[dict] = []
     last_day = -1
     deep_stops: list[dict] = []
+    equity_hourly: list[dict] = []
+    cur_hour, hour_min, hour_min_upl, last_row = -1, float("inf"), 0.0, None
+    worst_snapshot: dict = {}
     blocked_until: dict[str, float] = {}
     daily_close: dict[str, dict[int, float]] = {}
     n_level = cfg.params.n_levels
@@ -196,7 +199,13 @@ def run(cfg: BacktestConfig, stream: tuple[list, ...]) -> dict:
 
         upl_by[coin] = s.position_coin * (close - s.wavg_entry) if s.in_position else 0.0
         upl = sum(upl_by.values())
-        worst_upl = min(worst_upl, upl)
+        if upl < worst_upl:
+            worst_upl = upl
+            worst_snapshot = {"ts_ms": ts, "upl": upl, "coins": {
+                c: {"level": x.level, "cost": round(x.cost_basis_usd, 2),
+                    "first_entry_px": x.first_entry_px, "mark": mark.get(c),
+                    "upl": round(upl_by.get(c, 0.0), 2)}
+                for c, x in strat.states.items() if x.in_position}}
         eq = cfg.equity_usd + price_pnl + fee_total + upl
         peak = max(peak, eq)
         stop_peak = max(stop_peak, eq)
@@ -207,7 +216,17 @@ def run(cfg: BacktestConfig, stream: tuple[list, ...]) -> dict:
             hour_sampled = hour
             peak_h = max(peak_h, eq)
             max_dd_h = min(max_dd_h, (eq / peak_h - 1) * 100)
-        max_committed = max(max_committed, sum(x.cost_basis_usd for x in strat.states.values()))
+        committed = sum(x.cost_basis_usd for x in strat.states.values())
+        max_committed = max(max_committed, committed)
+        if hour != cur_hour:  # one row per hour: equity at the hour's last bar + its minute low
+            if last_row is not None:
+                equity_hourly.append({**last_row, "eq_min": round(hour_min, 2),
+                                      "upl_at_min": round(hour_min_upl, 2)})
+            cur_hour, hour_min = hour, float("inf")
+        if eq < hour_min:
+            hour_min, hour_min_upl = eq, upl
+        last_row = {"hour_ms": hour * HOUR_MS, "mtm_eq": round(eq, 2), "upl": round(upl, 2),
+                    "committed": round(committed, 2)}
         if strat.should_pause_new_openings()[0]:
             pause_ticks += 1
 
@@ -233,6 +252,9 @@ def run(cfg: BacktestConfig, stream: tuple[list, ...]) -> dict:
                                  "dd_pct_from_peak": round(dd, 4)})
             last_day = day
 
+    if last_row is not None:
+        equity_hourly.append({**last_row, "eq_min": round(hour_min, 2),
+                              "upl_at_min": round(hour_min_upl, 2)})
     final_upl = sum(upl_by.values())
     final_eq = cfg.equity_usd + price_pnl + fee_total + final_upl
     days = (t_all[-1] - t_all[0] + 60_000) / DAY_MS if t_all else 0.0
@@ -258,6 +280,8 @@ def run(cfg: BacktestConfig, stream: tuple[list, ...]) -> dict:
         "n_deep_stops": len(deep_stops),
         "deep_stop_pnl_total": sum(x["pnl"] for x in deep_stops),
         "deep_stops": deep_stops,
+        "worst_upl_snapshot": worst_snapshot,
+        "equity_hourly": equity_hourly,
         "orders_placed": broker.n_placed,
         "orders_cancelled": broker.n_cancelled,
         "risk_pause_pct": pause_ticks / n_bars * 100 if n_bars else 0.0,
