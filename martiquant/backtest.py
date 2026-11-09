@@ -14,6 +14,13 @@ On top of that it evaluates the risk controls under study:
                  Dropped coins finish their open round, then go quiet.
   delist_ms      {coin: ms}: an open position is settled at the bar close (taker fee,
                  no slippage) once the contract is delisted.
+  deep_stop_pct  per-coin stop that only exists past the ladder: once a coin is fully
+                 laddered and an hourly close (the hour's last 1m bar) is this far below
+                 the round's first entry, sell that coin at the close (taker fee +
+                 slippage) and block its new rounds for coin_cooldown_days.
+  entry_block_ret30_pct  regime gate for new rounds only: no first entry for a coin while
+                 its daily close yesterday is this far below its close 30 days before.
+                 Open rounds keep their TP and ladder.
 
 Reported max drawdown is always measured from the all-time equity peak; only the
 stop rule uses the reset peak. max_dd_pct uses every bar (catches minute-scale
@@ -47,6 +54,9 @@ class BacktestConfig:
     cooldown_days: float | None = 7.0
     rebalances: list[tuple[int, tuple[str, ...]]] = field(default_factory=list)
     delist_ms: dict[str, int] = field(default_factory=dict)
+    deep_stop_pct: float | None = None
+    coin_cooldown_days: float = 7.0
+    entry_block_ret30_pct: float | None = None
 
 
 def merge_bars(data: dict[str, dict[str, np.ndarray]], order: list[str]
@@ -84,6 +94,24 @@ def run(cfg: BacktestConfig, stream: tuple[list, ...]) -> dict:
     stops: list[dict] = []
     equity_daily: list[dict] = []
     last_day = -1
+    deep_stops: list[dict] = []
+    blocked_until: dict[str, float] = {}
+    daily_close: dict[str, dict[int, float]] = {}
+    n_level = cfg.params.n_levels
+
+    def entry_blocked(c: str, ts: int) -> bool:
+        if blocked_until.get(c, 0) > ts:
+            return True
+        if cfg.entry_block_ret30_pct is None:
+            return False
+        dc = daily_close.get(c, {})
+        day = ts // DAY_MS
+        a, b = dc.get(day - 1), dc.get(day - 31)
+        return a is not None and b is not None and (a / b - 1) * 100 <= -cfg.entry_block_ret30_pct
+
+    def desired(ts: int) -> list:
+        return [o for o in strat.desired_orders(mark)
+                if not (o.level_tag == 1 and entry_blocked(o.coin, ts))]
 
     def apply(f: SimFill, reason: str = "tp") -> None:
         nonlocal price_pnl, fee_total
@@ -142,6 +170,17 @@ def run(cfg: BacktestConfig, stream: tuple[list, ...]) -> dict:
             apply(f)
         close = c_all[i]
         mark[coin] = close
+        daily_close.setdefault(coin, {})[ts // DAY_MS] = close
+
+        if (cfg.deep_stop_pct is not None and not halted and s.in_position
+                and s.level >= n_level and ts % HOUR_MS == HOUR_MS - 60_000
+                and close <= s.first_entry_px * (1 - cfg.deep_stop_pct / 100)):
+            before = price_pnl + fee_total
+            force_close(coin, ts, cfg.stop_slippage, "deep_stop")
+            deep_stops.append({"ts_ms": ts, "coin": coin, "px": close,
+                               "pnl": price_pnl + fee_total - before})
+            blocked_until[coin] = ts + cfg.coin_cooldown_days * DAY_MS
+            hour_last = -1  # reconcile now so the blocked coin posts nothing
 
         delist = cfg.delist_ms.get(coin)
         if delist is not None and ts >= delist:
@@ -152,7 +191,7 @@ def run(cfg: BacktestConfig, stream: tuple[list, ...]) -> dict:
 
         hour = ts // HOUR_MS
         if not halted and (fills or hour != hour_last):
-            broker.reconcile(strat.desired_orders(mark))
+            broker.reconcile(desired(ts))
             hour_last = hour
 
         upl_by[coin] = s.position_coin * (close - s.wavg_entry) if s.in_position else 0.0
@@ -216,6 +255,9 @@ def run(cfg: BacktestConfig, stream: tuple[list, ...]) -> dict:
         "n_stops": len(stops),
         "stop_loss_total": sum(x["eq_after"] - x["stop_peak"] for x in stops),
         "halted_at_end": halted_until is not None,
+        "n_deep_stops": len(deep_stops),
+        "deep_stop_pnl_total": sum(x["pnl"] for x in deep_stops),
+        "deep_stops": deep_stops,
         "orders_placed": broker.n_placed,
         "orders_cancelled": broker.n_cancelled,
         "risk_pause_pct": pause_ticks / n_bars * 100 if n_bars else 0.0,

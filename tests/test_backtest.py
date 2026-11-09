@@ -73,6 +73,41 @@ class BacktestTests(unittest.TestCase):
         self.assertEqual([x["exit"] for x in r["rounds"]], ["delisted"])
         self.assertAlmostEqual(r["realized_price_pnl"], -5.0)
 
+    def test_deep_stop_only_on_full_ladder_at_hour_close(self):
+        # entry 100 (bar1), add at 90 fills (bar2) -> full ladder; then 70 for the rest of
+        # the hour. Stop at 25% below first entry fires on the hour's last bar (index 59).
+        closes = [100, 100, 90] + [70] * 57 + [70] * 120
+        r = run(cfg(deep_stop_pct=25.0), merge_bars({"AAA": bars(closes)}, ["AAA"]))
+        self.assertEqual(r["n_deep_stops"], 1)
+        self.assertEqual(r["deep_stops"][0]["ts_ms"], 59 * 60_000)
+        self.assertAlmostEqual(r["deep_stops"][0]["pnl"], (1 + 200 / 90) * 70 - 300)
+        self.assertEqual([x["exit"] for x in r["rounds"]], ["deep_stop"])
+        self.assertEqual(r["open_upl"], 0.0)  # cooldown: no new round in the remaining bars
+
+    def test_deep_stop_ignores_partial_ladder(self):
+        # 2-level ladder at -10%/-60%: at 70 only the first add filled, so no stop
+        p = LadderParams(name="T2", ladder_drops_pct=(-10.0, -60.0), size_multipliers_usd=(2.0, 4.0),
+                         tp_pct=1.0, first_entry_usd_default=100.0)
+        closes = [100, 100, 90] + [70] * 120
+        r = run(cfg(params=p, deep_stop_pct=25.0), merge_bars({"AAA": bars(closes)}, ["AAA"]))
+        self.assertEqual(r["n_deep_stops"], 0)
+
+    def test_entry_block_stops_new_rounds_in_a_collapse(self):
+        # one bar per day, -2%/day; each day's high bounces 4% over the prior close, so
+        # rounds open on one bar and take profit (+1%) on the next, all the way down.
+        n = 60
+        c = 100 * 0.98 ** np.arange(n)
+        hi = np.r_[c[0], c[:-1] * 1.04]
+        day = lambda closes, highs: {"t": np.arange(n, dtype=np.int64) * 86_400_000,
+                                     "h": highs, "l": closes, "c": closes}
+        free = run(cfg(), merge_bars({"AAA": day(c, hi)}, ["AAA"]))
+        gated = run(cfg(entry_block_ret30_pct=30.0), merge_bars({"AAA": day(c, hi)}, ["AAA"]))
+        last = lambda r: max(x["close_time_ms"] for x in r["rounds"]) // 86_400_000
+        self.assertGreater(last(free), 55)
+        # 30-day return first known on day 31 (closes of day 30 vs day 0: -45%)
+        self.assertLessEqual(last(gated), 33)
+        self.assertLess(gated["rounds_closed"], free["rounds_closed"])
+
     def test_merge_breaks_time_ties_by_basket_order(self):
         t, coins, *_ = merge_bars({"B": bars([1, 1]), "A": bars([1, 1])}, ["A", "B"])
         self.assertEqual(coins, ["A", "B", "A", "B"])
